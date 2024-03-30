@@ -3,4 +3,4 @@ Implement commands not implemented in mac
 
 # Implemented commands
 - ip
-- free
+- free: You can use "-k, -m, -g, -h" options. Other options are not implemented.
