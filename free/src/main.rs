@@ -1,8 +1,6 @@
-extern crate sys_info;
 use regex::Regex;
 use std::env;
 use std::process::Command;
-use sys_info::MemInfo;
 
 struct UnixMemInfo {
     // MemInfo like Unix
@@ -16,22 +14,64 @@ struct UnixMemInfo {
     swap_free: u64,
 }
 
-fn init_unixmeminfo(mem_info: MemInfo) -> UnixMemInfo {
-    let swap_used = mem_info.swap_total - mem_info.swap_free;
-    let [buff_cache, used] = extract_ex_meminfo();
+fn init_unixmeminfo() -> UnixMemInfo {
+    let [total, used, free, avail, buff_cache, swap_total, swap_used, swap_free] =
+        extract_unixmeminfo();
     UnixMemInfo {
-        total: mem_info.total,
+        total: total,
         used: used,
-        free: mem_info.free,
-        avail: mem_info.avail,
+        free: free,
+        avail: avail,
         buff_cache: buff_cache,
-        swap_total: mem_info.swap_total,
+        swap_total: swap_total,
         swap_used: swap_used,
-        swap_free: mem_info.swap_free,
+        swap_free: swap_free,
     }
 }
 
-fn extract_ex_meminfo() -> [u64; 2] {
+fn extract_unixmeminfo() -> [u64; 8] {
+    let total = extract_memsize();
+    let [free, avail, buff_cache, used] = extract_ex_meminfo();
+    let [swap_total, swap_used, swap_free] = extract_swapinfo();
+    [
+        total, used, free, avail, buff_cache, swap_total, swap_used, swap_free,
+    ]
+}
+
+fn extract_memsize() -> u64 {
+    let output = Command::new("sysctl")
+        .arg("hw.memsize")
+        .output()
+        .expect("failed to execute sysctl");
+    let output_str = String::from_utf8(output.stdout).unwrap();
+    let re = Regex::new(r"\d+").unwrap();
+    let mut memsize: u64 = re.find(&output_str).unwrap().as_str().parse().unwrap();
+    memsize = memsize >> 10;
+    memsize
+}
+
+fn extract_swapinfo() -> [u64; 3] {
+    // sysctl
+    let output = Command::new("sysctl")
+        .arg("vm.swapusage")
+        .output()
+        .expect("failed to execute sysctl");
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    // Define regex to extract u64 numbers.
+    let re = Regex::new(r"[-+]?\d*\.\d+|\d+").unwrap();
+    let extracted_num: Vec<f64> = re
+        .find_iter(&output_str) // 正規表現にマッチする部分をイテレート
+        .filter_map(|m| m.as_str().parse().ok()) // マッチした部分を数値に変換し、Someで返す
+        .collect();
+
+    let mut kilobytes_num: [u64; 3] = [0; 3];
+    for (idx, num) in extracted_num.iter().enumerate() {
+        kilobytes_num[idx] = (*num * 1024.0) as u64;
+    }
+    kilobytes_num
+}
+
+fn extract_ex_meminfo() -> [u64; 4] {
     // vm_stat
     let output = Command::new("vm_stat")
         .output()
@@ -43,6 +83,8 @@ fn extract_ex_meminfo() -> [u64; 2] {
 
     // Define regex to extract u64 numbers.
     let re = Regex::new(r"\d+").unwrap();
+    let mut pages_free = 0_u64;
+    let mut pages_avail = 0_u64;
     let mut page_size = 0_u64;
     let mut page_cache = 0_u64;
     let mut used = 0_u64;
@@ -57,7 +99,8 @@ fn extract_ex_meminfo() -> [u64; 2] {
         if idx == 0 {
             let extracted_num: u64 = re.find(line).unwrap().as_str().parse().unwrap();
             page_size = extracted_num;
-        } else if line.contains("Pages purgeable") || line.contains("File-backed pages") {
+        }
+        if line.contains("Pages purgeable") || line.contains("File-backed pages") {
             let extracted_num: u64 = re.find(line).unwrap().as_str().parse().unwrap();
             page_cache += extracted_num * page_size;
         }
@@ -67,11 +110,28 @@ fn extract_ex_meminfo() -> [u64; 2] {
                 used += extracted_num * page_size;
             }
         }
+
+        // free and avail caliculation is as follows
+        if line.contains("Pages free") {
+            let extracted_num: u64 = re.find(line).unwrap().as_str().parse().unwrap();
+            pages_free += extracted_num * page_size;
+            pages_avail += extracted_num * page_size;
+        }
+        if line.contains("Pages inactive") {
+            let extracted_num: u64 = re.find(line).unwrap().as_str().parse().unwrap();
+            pages_avail += extracted_num * page_size;
+        }
+        if line.contains("Pages speculative") {
+            let extracted_num: u64 = re.find(line).unwrap().as_str().parse().unwrap();
+            pages_free -= extracted_num * page_size;
+        }
     }
     used -= page_cache; // substract page_cache to calculate truly used memories
     page_cache = page_cache >> 10; // bytes -> kilo bytes
     used = used >> 10;
-    [page_cache, used]
+    pages_free = pages_free >> 10;
+    pages_avail = pages_avail >> 10;
+    [pages_free, pages_avail, page_cache, used]
 }
 
 fn is_used_memory(line: &str, column_name: &str) -> bool {
@@ -82,8 +142,7 @@ fn is_used_memory(line: &str, column_name: &str) -> bool {
 }
 
 fn free(args: Vec<String>) {
-    let mem_info = sys_info::mem_info().unwrap();
-    format_mem_info(mem_info, args);
+    format_mem_info(args);
 }
 
 fn make_args() -> Vec<String> {
@@ -92,10 +151,10 @@ fn make_args() -> Vec<String> {
     args
 }
 
-fn format_mem_info(mem_info: MemInfo, args: Vec<String>) {
+fn format_mem_info(args: Vec<String>) {
     // header, not swaped, swapedの順に出力する
     let mut header = "               total         used       free       avail   buff/cache";
-    let mut unixmem_info: UnixMemInfo = init_unixmeminfo(mem_info); // This variable is mutable because options can change the value.
+    let mut unixmem_info: UnixMemInfo = init_unixmeminfo(); // This variable is mutable because options can change the value.
     let valid_options = [
         "-k".to_string(),
         "-m".to_string(),
